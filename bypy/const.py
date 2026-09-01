@@ -53,6 +53,8 @@ IEParameterError = 31023 # {'error_code': 31023, 'error_msg': 'param error', 're
 IESuperfileCreationFailed = 31081 # superfile create failed (HTTP 404)
 # Undocumented, see #308 , https://paste.ubuntu.com/23672323/
 IEBlockMissInSuperFile2 = 31363 # block miss in superfile2 (HTTP 403)
+IEFirstSliceTooSmall = 31299 # 第一个分片的大小小于4MB
+IESliceSizeExceed = 31364 # 超出分片大小限制(普通用户单分片上限4MB)
 IETaskNotFound = 36016 # Task was not found
 IEFileAlreadyExists = 31061 # {"error_code":31061,"error_msg":"file already exists","request_id":2939656146461714799}
 IEAppIDIsEmpty = 31024 # {'error_code': 31024, 'error_msg': 'app id is empty', 'request_id': 5638555241104030586} (HTTP 400)
@@ -88,6 +90,8 @@ ErrorExplanations = {
 	IESuperfileCreationFailed: "superfile create failed (HTTP 404)",
 	# Undocumented, see #308 , https://paste.ubuntu.com/23672323/
 	IEBlockMissInSuperFile2: "Block miss in superfile2 (HTTP 403)",
+	IEFirstSliceTooSmall: "First slice smaller than 4MB",
+	IESliceSizeExceed: "Slice size exceeds the limit (4MB for normal users)",
 	IETaskNotFound: "Task was not found",
 	IEFileAlreadyExists: "File already exists"
 }
@@ -157,6 +161,9 @@ RestApiPath = '/rest/2.0/pcs/'
 PcsUrl = 'https://' + PcsDomain + RestApiPath
 CPcsUrl = 'https://c.pcs.baidu.com/rest/2.0/pcs/'
 DPcsUrl = 'https://d.pcs.baidu.com/rest/2.0/pcs/'
+# 新版开放平台 xpan API (precreate / create 等)
+XPanUrl = 'https://pan.baidu.com/rest/2.0/xpan/'
+CPcsBaseUrl = 'https://c.pcs.baidu.com'
 
 ## Baidu PCS constants
 MinRapidUploadFileSize = 256 * OneK
@@ -180,10 +187,10 @@ HashCacheFileName = 'bypy.hashcache.json'
 HashCachePath = ConfigDir + os.sep + HashCacheFileName
 PickleFileName = 'bypy.pickle'
 PicklePath = ConfigDir + os.sep + PickleFileName
-# ProgressPath saves the MD5s of uploaded slices, for upload resuming
+# ProgressPath saves the uploadids of in-progress slice uploads, for upload resuming
 # format:
 # {
-# 	abspath: [slice_size, [slice1md5, slice2md5, ...]],
+# 	abspath: [slice_size, uploadid],
 # }
 #
 ProgressFileName = 'bypy.parts.json'
@@ -204,8 +211,10 @@ UserAgent = None # According to xslidian, User-Agent affects download.
 #UserAgent = 'Mozilla/5.0'
 #UserAgent = "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.1; WOW64; Trident/6.0)"
 #UserAgent = 'netdisk;5.2.7.2;PC;PC-Windows;6.2.9200;WindowsBaiduYunGuanJia'
-DefaultSliceInMB = 20
-DefaultSliceSize = 20 * OneM
+# 官方分片上传文档: 普通用户分片大小固定为4MB, 普通会员上限16MB, 超级会员上限32MB
+# https://pan.baidu.com/union/doc/ 基础网盘服务 > 上传 > 分片上传
+DefaultSliceInMB = 4
+DefaultSliceSize = 4 * OneM
 DefaultDlChunkSize = 20 * OneM
 RetryDelayInSec = 10
 CacheSavePeriodInSec = 10 * 60.0

@@ -75,7 +75,7 @@ from . import printer_console
 from . import cached as cachedm
 from . import util
 from . import printer
-from .cached import (cached, stringifypickle, md5, crc32, slice_md5)
+from .cached import (cached, stringifypickle, md5, crc32, slice_md5, encrypt_md5)
 from .struct import PathDictTree
 from .util import (
 	iswindows,
@@ -143,6 +143,7 @@ if Pool != None:
 pcsurl = const.PcsUrl
 cpcsurl = const.CPcsUrl
 dpcsurl = const.DPcsUrl
+xpanurl = const.XPanUrl
 
 # This crap is here to avoid circular imports
 # What a fantastic packing architecture Python has!
@@ -772,6 +773,8 @@ class ByPy(object):
 					ec == 31066 or # sc == 403 (indeed 404) file does not exist
 					ec == const.IETaskNotFound or # 36016 or # sc == 404 Task was not found
 					ec == const.IEParameterError or # sc == 400 param error
+					ec == const.IEFirstSliceTooSmall or # 31299 第一个分片小于4MB, 重试无意义
+					ec == const.IESliceSizeExceed or # 31364 超出分片大小限制, 重试无意义
 					# the following was found by xslidian, but i have never ecountered before
 					ec == 31390):  # sc == 404 # {"error_code":31390,"error_msg":"Illegal File"} # r.url.find('http://bcscdn.baidu.com/bcs-cdn/wenxintishi') == 0
 					result = ec
@@ -1554,15 +1557,21 @@ get information of the given path (dir / file) at Baidu Yun.
 			pars, act, remotepath,
 			headers=headers, data=form)
 
-	def _upload_slice(self, remotepath):
+	def _upload_slice(self, remotepath, uploadid, partseq, server):
+		# 新版分片上传接口 superfile2, 必须携带 precreate 下发的 uploadid 和分片序号 partseq
+		# https://pan.baidu.com/union/doc/ 基础网盘服务 > 上传 > 分片上传
 		pars = {
 			'method' : 'upload',
-			'type' : 'tmpfile'}
+			'type' : 'tmpfile',
+			'path' : remotepath,
+			'uploadid' : uploadid,
+			'partseq' : partseq }
 
 		return self._stream_upload(self._current_slice,
-				pars, self._upload_slice_act, remotepath)
+				pars, self._upload_slice_act, remotepath,
+				url = server + const.RestApiPath + 'superfile2')
 
-	def _update_progress_entry(self, fullpath):
+	def _update_progress_entry(self, fullpath, uploadid):
 		progress = {}
 
 		try:
@@ -1571,7 +1580,7 @@ get information of the given path (dir / file) at Baidu Yun.
 			perr("Error loading the progress for: '{}'.\n{}.".format(fullpath, formatex(ex)))
 
 		self.pd("Updating slice upload progress for {}".format(fullpath))
-		progress[fullpath] = (self._slice_size, self._slice_md5s)
+		progress[fullpath] = (self._slice_size, uploadid)
 
 		try:
 			jsondump(progress, self._progresspath, mpsemaphore)
@@ -1589,110 +1598,215 @@ get information of the given path (dir / file) at Baidu Yun.
 		except Exception as ex:
 			perr("Error deleting the progress for: '{}'.\n{}.".format(fullpath, formatex(ex)))
 
-	def _upload_file_slices(self, localpath, remotepath, ondup = 'overwrite'):
-		pieces = const.MaxSlicePieces
-		slice = self._slice_size
-		if self._current_file_size <= self._slice_size * const.MaxSlicePieces:
-			# slice them using slice size
-			pieces = (self._current_file_size + self._slice_size - 1 ) // self._slice_size
-		else:
-			# the following comparision is done in the caller:
-			# elif self._current_file_size <= MaxSliceSize * MaxSlicePieces:
+	def _compute_block_list(self, localpath, slice):
+		# block_list: 按官方文档, 文件按 slice 大小切分, 各分片 MD5(32位小写)组成的列表
+		md5s = []
+		with io.open(localpath, 'rb') as f:
+			while True:
+				buf = f.read(slice)
+				if not buf:
+					break
+				md5s.append(hashlib.md5(buf).hexdigest())
+		return md5s
 
+	# 新版开放平台上传流程 (https://pan.baidu.com/union/doc/ 基础网盘服务 > 上传):
+	#   1. precreate 预上传, 换取 uploadid (秒传也在此阶段完成)
+	#   2. locateupload 获取上传域名
+	#   3. superfile2 逐个分片上传 (带 uploadid + partseq)
+	#   4. create 创建文件
+	# 旧的 PCS 接口已经下线:
+	#   - upload&type=tmpfile 恒返回 31064 "file is not authorized"
+	#   - rapidupload 恒返回 31023 "param error"
+	def _ondup_to_rtype(self, ondup):
+		# xpan rtype: 1 重命名, 2 block_list 不同时重命名, 3 覆盖
+		return 3 if ondup == 'overwrite' else 1
+
+	def _precreate_act(self, r, args):
+		j = r.json()
+		self.jsonq.append(j)
+		if j.get('errno', -1) == 0:
+			self._precreate_json = j
+			return const.ENoError
+		perr("precreate failed: {}".format(j))
+		return const.ERequestFailed
+
+	def _precreate_file(self, remotepath, size, block_list, ondup, withhashes = False, uploadid = None):
+		self._precreate_json = None
+		data = {
+			'path' : remotepath,
+			'size' : size,
+			'isdir' : 0,
+			'autoinit' : 1,
+			'rtype' : self._ondup_to_rtype(ondup),
+			'block_list' : json.dumps(block_list) }
+		if uploadid:
+			# 传入已有 uploadid 可续传: 服务器在 block_list 里返回剩余分片序号
+			data['uploadid'] = uploadid
+		if withhashes:
+			# 带上 content-md5 / slice-md5 以提高秒传命中率
+			data['content-md5'] = self._current_file_md5
+			data['slice-md5'] = self._current_file_slice_md5
+		return self._post(xpanurl + 'file', { 'method' : 'precreate' },
+				self._precreate_act, remotepath, data = data)
+
+	def _locate_upload_server_act(self, r, args):
+		j = r.json()
+		self.jsonq.append(j)
+		for s in j.get('servers') or []:
+			server = s.get('server', '')
+			if server.startswith('https'):
+				self._upload_server = server
+				return const.ENoError
+		return const.ERequestFailed
+
+	def _locate_upload_server(self, remotepath, uploadid):
+		self._upload_server = None
+		pars = {
+			'method' : 'locateupload',
+			'appid' : 250528, # 官方文档固定值
+			'path' : remotepath,
+			'uploadid' : uploadid,
+			'upload_version' : '2.0' }
+		ec = self._get(dpcsurl + 'file', pars,
+				self._locate_upload_server_act, remotepath)
+		if ec == const.ENoError and self._upload_server:
+			return self._upload_server
+		self.pd("locateupload failed, falling back to " + const.CPcsBaseUrl)
+		return const.CPcsBaseUrl
+
+	def _create_file_act(self, r, args):
+		j = r.json()
+		self.jsonq.append(j)
+		result = self._verify_created_file(j)
+		if result == const.ENoError:
+			self.pv("'{}' =C=> '{}' OK.".format(self._current_file, args))
+		else:
+			perr("'{}' =C=> '{}' FAILED.".format(self._current_file, args))
+		return result
+
+	def _verify_created_file(self, j):
+		# 校验 create 接口的返回。
+		# 注意: 多分片文件的 md5 并不是整文件的 md5, 而是
+		# encrypt_md5(md5(block_list 的紧凑 json 串))
+		rsize = j.get('size')
+		rmd5 = j.get('md5')
+		if rsize is None or rmd5 is None:
+			perr("Unable to verify JSON: '{}', no 'size' or 'md5' entry found".format(j))
+			return const.EHashMismatch
+		if rsize != self._current_file_size:
+			pinfo("Local and remote file size DOESN'T match")
+			return const.EHashMismatch
+		if not self._verify:
+			return const.ENoError
+		if len(self._current_block_list) > 1:
+			bljson = json.dumps(self._current_block_list, separators=(',', ':'))
+			expected = encrypt_md5(hashlib.md5(bljson.encode('utf-8')).hexdigest())
+		else:
+			expected = md5(self._current_file)
+		self.pd("Expected remote MD5: {}".format(expected))
+		self.pd("Actual   remote MD5: {}".format(rmd5))
+		if expected == rmd5:
+			return const.ENoError
+		pinfo("Local and remote file hash DOESN'T match")
+		return const.EHashMismatch
+
+	def _create_file(self, remotepath, size, uploadid, block_list, ondup = 'overwrite'):
+		data = {
+			'path' : remotepath,
+			'size' : size,
+			'isdir' : 0,
+			'uploadid' : uploadid,
+			'rtype' : self._ondup_to_rtype(ondup),
+			'block_list' : json.dumps(block_list) }
+		return self._post(xpanurl + 'file', { 'method' : 'create' },
+				self._create_file_act, remotepath, data = data)
+
+	def _upload_file_slices(self, localpath, remotepath, ondup = 'overwrite'):
+		slice = self._slice_size
+		if self._current_file_size > slice * const.MaxSlicePieces:
 			# no choice, but need to slice them to 'MaxSlicePieces' pieces
 			slice = (self._current_file_size + const.MaxSlicePieces - 1) // const.MaxSlicePieces
+		pieces = (self._current_file_size + slice - 1) // slice
 
 		self.pd("Slice size: {}, Pieces: {}".format(slice, pieces))
 
-		i = 0
-		ec = const.ENoError
+		block_list = self._compute_block_list(localpath, slice)
+		self._current_block_list = block_list
 
-		fullpath = os.path.abspath(self._current_file)
-		progress = {}
-		initial_offset = 0
-		# create an empty progress file first
-		if not os.path.exists(self._progresspath):
-			try:
-				jsondump(progress, self._progresspath, mpsemaphore)
-			except Exception as ex:
-				perr("Error savingprogress, no resumption.\n{}".format(formatex(ex)))
-
+		# 检查是否有未完成的上传任务, 有则用保存的 uploadid 续传
+		fullpath = os.path.abspath(localpath)
+		saved_uploadid = None
 		try:
 			progress = jsonload(self._progresspath)
+			if fullpath in progress:
+				(pslice, puploadid) = progress[fullpath]
+				# 旧格式进度(slice_md5 列表)已无法用于续传, 直接忽略
+				if pslice == slice and isinstance(puploadid, str):
+					saved_uploadid = puploadid
+					self.pd("Found saved uploadid {}, resuming".format(saved_uploadid))
 		except Exception as ex:
 			perr("Error loading progress, no resumption.\n{}".format(formatex(ex)))
 
-		if fullpath in progress:
-			self.pd("Find the progress entry resume uploading")
-			(slice, md5s) = progress[fullpath]
-			self._slice_md5s = []
-			with io.open(self._current_file, 'rb') as f:
-				self.pd("Verifying the md5s. Total count = {}".format(len(md5s)))
-				for md in md5s:
-					cslice = f.read(slice)
-					cm = hashlib.md5(cslice)
-					if (cm.hexdigest() == md):
-						self.pd("{} verified".format(md))
-						# TODO: a more rigorous check would be also verifying
-						# slices exist at Baidu Yun as well (rapidupload test?)
-						# but that's a bit complex. for now, we don't check
-						# this but simply delete the progress entry if later
-						# we got error combining the slices.
-						self._slice_md5s.append(md)
-					else:
-						break
-				self.pd("verified md5 count = {}".format(len(self._slice_md5s)))
-			i = len(self._slice_md5s)
-			initial_offset = i * slice
-			self.pd("Start from offset {}".format(initial_offset))
+		# 1. 预上传, 换取 uploadid; 服务器在 block_list 里返回仍需上传的分片序号
+		ec = self._precreate_file(remotepath, self._current_file_size, block_list, ondup,
+				uploadid = saved_uploadid)
+		if ec != const.ENoError and saved_uploadid:
+			# 保存的 uploadid 可能已过期, 另起一个全新的上传任务
+			self.pd("precreate with saved uploadid failed, starting a fresh upload task")
+			ec = self._precreate_file(remotepath, self._current_file_size, block_list, ondup)
+		if ec != const.ENoError:
+			return ec
 
-		with io.open(self._current_file, 'rb') as f:
+		j = self._precreate_json
+		if j.get('return_type') == 2:
+			# 秒传成功, 无需上传任何分片
+			self.pv("'{}' =R=> '{}' OK (rapidupload at precreate).".format(localpath, remotepath))
+			return const.ENoError
+
+		uploadid = j['uploadid']
+		to_upload = j.get('block_list') or [0] # 官方文档: block_list 为空等价于 [0]
+		self.pd("uploadid: {}, slices to upload: {}".format(uploadid, to_upload))
+		# 保存 uploadid 以便中断后续传
+		self._update_progress_entry(fullpath, uploadid)
+
+		# 2. 获取上传域名
+		server = self._locate_upload_server(remotepath, uploadid)
+
+		# 3. 逐个分片上传
+		with io.open(localpath, 'rb') as f:
 			start_time = time.time()
-			f.seek(initial_offset, os.SEEK_SET)
-			while i < pieces:
+			count = 0
+			for i in to_upload:
+				f.seek(i * slice, os.SEEK_SET)
 				self._current_slice = f.read(slice)
-				m = hashlib.md5()
-				m.update(self._current_slice)
-				self._current_slice_md5 = m.hexdigest()
+				self._current_slice_md5 = block_list[i]
 				self.pd("Uploading MD5 slice: {}, #{} / {}".format(
 					self._current_slice_md5,
-					i + 1, pieces))
-				j = 0
+					count + 1, len(to_upload)))
+				tries = 0
 				while True:
-					ec = self._upload_slice(remotepath)
+					ec = self._upload_slice(remotepath, uploadid, i, server)
 					if ec == const.ENoError:
 						self.pd("Slice MD5 match, continuing next slice")
-						pprgr(f.tell(), self._current_file_size, start_time, initial_offset)
-						self._update_progress_entry(fullpath)
+						pprgr(f.tell(), self._current_file_size, start_time, to_upload[0] * slice)
 						break
-					elif j < self._retry:
-						j += 1
+					elif tries < self._retry:
+						tries += 1
 						# TODO: Improve or make it DRY with the _request retry logic
 						perr("Slice MD5 mismatch, waiting {} seconds before retrying...".format(const.RetryDelayInSec))
 						time.sleep(const.RetryDelayInSec)
-						perr("Retrying #{} / {}".format(j + 1, self._retry))
+						perr("Retrying #{} / {}".format(tries + 1, self._retry))
 					else:
-						self._slice_md5s = []
 						break
 				if ec != const.ENoError:
-					break
-				i += 1
+					return ec
+				count += 1
 
-		if ec != const.ENoError:
-			return ec
-		else:
-			#self.pd("Sleep 2 seconds before combining, just to be safer.")
-			#time.sleep(2)
-			ec = self._combine_file(remotepath, ondup = 'overwrite')
-			if ec == const.ENoError \
-				or ec == const.IESuperfileCreationFailed \
-				or ec == const.IEBlockMissInSuperFile2 \
-				or ec == const.EMaxRetry: # to handle undocumented error codes if any
-				# we delete on success or failure caused by
-				# the slices uploaded expired / became invalid
-				# (needed for a fresh re-upload later)
-				self._delete_progress_entry(fullpath)
-			return ec
+		# 4. 创建文件
+		ec = self._create_file(remotepath, self._current_file_size, uploadid, block_list, ondup)
+		# 上传任务已结束(无论成败), 删除进度记录
+		self._delete_progress_entry(fullpath)
+		return ec
 
 	def _rapidupload_file_act(self, r, args):
 		if self._verify:
@@ -1729,10 +1843,18 @@ get information of the given path (dir / file) at Baidu Yun.
 	def _rapidupload_file(self, lpath, rpath, ondup = 'overwrite', setlocalfile = False):
 		self._get_hashes_for_rapidupload(lpath, setlocalfile)
 
-		md5str = self._current_file_md5
-		slicemd5str =  self._current_file_slice_md5
-		crcstr = hex(self._current_file_crc32)
-		return self._rapidupload_file_post(rpath, self._current_file_size, md5str, slicemd5str, crcstr, ondup)
+		# 旧 PCS 的 rapidupload 接口已下线(恒返回 31023 "param error")。
+		# 新版开放平台 API 中, 秒传通过 precreate 实现: 提交
+		# content-md5 / slice-md5 / block_list 后, 若服务器已有相同内容,
+		# 返回 return_type == 2, 文件直接创建成功, 无需上传
+		block_list = self._compute_block_list(lpath, const.DefaultSliceSize)
+		ec = self._precreate_file(rpath, self._current_file_size, block_list, ondup, withhashes = True)
+		if ec != const.ENoError:
+			return ec
+		if self._precreate_json.get('return_type') == 2:
+			return const.ENoError
+		# 秒传未命中, 返回 IEMD5NotFound 让调用方走正常上传流程
+		return const.IEMD5NotFound
 
 	def _upload_one_file_act(self, r, args):
 		result = self._verify_current_file(r.json(), False)
