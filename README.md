@@ -28,6 +28,21 @@ TL;DR
 
 ---
 
+bypy-next 分叉说明 / About this fork
+------------------------------------
+
+本分叉在原版基础上修复/增强了以下两点：
+
+1. **修复分片上传与秒传**：百度已下线旧 PCS 上传接口（分片上传 `upload&type=tmpfile` 恒返回 `31064 file is not authorized`，秒传 `method=rapidupload` 恒返回 `31023 param error`）。现已按[百度官方文档](https://pan.baidu.com/union/doc)迁移到 xpan 新流程：`precreate` → `locateupload` → `superfile2`（带 `uploadid`/`partseq`）→ `create`；秒传改由 `precreate` 实现（`return_type == 2` 即命中）；默认分片大小改为 4MB（普通用户的限制，会员可用 `--slice` 调大）；断点续传改为服务端方案——保存 `uploadid`，重跑时 `precreate` 会只返回剩余分片。
+2. **分片并发上传**：新增 `--upload-threads N` 选项（默认 4），单文件的分片并发上传；实测 100MB 文件从 22s 降至 6s（约 3.7x）。`--upload-threads 1` 可回到串行。
+
+This fork contains two changes on top of the original bypy:
+
+1. **Fix broken slice upload / rapidupload** by migrating to the current xpan API (`precreate` → `locateupload` → `superfile2` with `uploadid`/`partseq` → `create`). Rapid-upload now goes through `precreate`, the default slice size is 4MB (required for normal users), and resumable upload is handled server-side via `uploadid`.
+2. **Parallel slice upload**: new `--upload-threads N` option (default: 4) uploads the slices of a single file concurrently (~3.7x faster in a 100MB test). Use `--upload-threads 1` for the old sequential behavior.
+
+---
+
 **如果有人想帮助搭国内建授权服务器的话，请按以下步骤进行:**
 
 1. Clone <https://github.com/houtianze/bypyoauth> 并用任意值配置好环境变量后成功运行服务
