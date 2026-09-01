@@ -223,6 +223,8 @@ DefaultTimeOutInSeconds=300
 ShareRapidUploadRetries = 3
 DefaultResumeDlRevertCount = 1
 DefaultProcessCount = 1
+# 分片并发上传的默认线程数
+DefaultUploadThreads = 4
 
 ## program switches
 CleanOptionShort = '-c'

@@ -48,7 +48,13 @@ import socket
 import subprocess
 import shlex
 import atexit
+import threading
 from collections import deque
+try:
+	from concurrent.futures import ThreadPoolExecutor, as_completed
+except ImportError:
+	# Python 2 without the 'futures' backport
+	ThreadPoolExecutor = None
 #from collections import OrderedDict
 from functools import partial
 from argparse import ArgumentParser
@@ -313,7 +319,8 @@ class ByPy(object):
 		downloader = "",
 		downloader_args = "",
 		processes = const.DefaultProcessCount,
-		secretkey = const.SecretKey):
+		secretkey = const.SecretKey,
+		upload_threads = const.DefaultUploadThreads):
 		super(ByPy, self).__init__()
 		self.jsonq = deque(maxlen = 64)
 
@@ -387,6 +394,7 @@ class ByPy(object):
 			self.pd("Forcing verification since we will delete source for successful transfers.")
 			self._verify = True
 		self.processes = processes
+		self._upload_threads = upload_threads
 
 		# in case of abortions, exceptions, etc
 		atexit.register(self.cleanup)
@@ -1571,6 +1579,72 @@ get information of the given path (dir / file) at Baidu Yun.
 				pars, self._upload_slice_act, remotepath,
 				url = server + const.RestApiPath + 'superfile2')
 
+	# 以下三个函数用于并发分片上传, 不读写 self._current_slice 等共享状态, 线程安全
+	def _upload_slice_data_act(self, r, args):
+		# args: (remotepath, expected_md5)
+		j = r.json()
+		rsmd5 = j['md5']
+		self.pd("Uploaded MD5 slice: " + rsmd5)
+		if args[1] == rsmd5:
+			self.pv("'{}' >>==> '{}' OK.".format(self._current_file, args[0]))
+			return const.ENoError
+		perr("'{}' >>==> '{}' FAILED.".format(self._current_file, args[0]))
+		return const.EHashMismatch
+
+	def _upload_slice_data(self, data, expected_md5, remotepath, uploadid, partseq, server):
+		pars = {
+			'method' : 'upload',
+			'type' : 'tmpfile',
+			'path' : remotepath,
+			'uploadid' : uploadid,
+			'partseq' : partseq }
+
+		return self._stream_upload(data,
+				pars, self._upload_slice_data_act, (remotepath, expected_md5),
+				url = server + const.RestApiPath + 'superfile2')
+
+	def _upload_slice_worker(self, localpath, slice, i, expected_md5, remotepath, uploadid, server):
+		# 每个线程使用自己的文件句柄读取分片
+		with io.open(localpath, 'rb') as f:
+			f.seek(i * slice, os.SEEK_SET)
+			data = f.read(slice)
+		tries = 0
+		while True:
+			ec = self._upload_slice_data(data, expected_md5, remotepath, uploadid, i, server)
+			if ec == const.ENoError:
+				return (i, len(data), const.ENoError)
+			if tries < self._retry:
+				tries += 1
+				perr("Slice #{} upload failed, waiting {} seconds before retrying...".format(
+					i, const.RetryDelayInSec))
+				time.sleep(const.RetryDelayInSec)
+				perr("Retrying #{} / {}".format(tries + 1, self._retry))
+			else:
+				return (i, 0, ec)
+
+	def _upload_slices_parallel(self, localpath, slice, to_upload, block_list, remotepath, uploadid, server):
+		total = self._current_file_size
+		# 续传场景下已上传完成的字节数
+		initial = total - sum(min(slice, total - i * slice) for i in to_upload)
+		uploaded = [initial]
+		failures = []
+		start_time = time.time()
+
+		with ThreadPoolExecutor(max_workers = self._upload_threads) as executor:
+			futures = [executor.submit(
+					self._upload_slice_worker,
+					localpath, slice, i, block_list[i], remotepath, uploadid, server)
+				for i in to_upload]
+			for fut in as_completed(futures):
+				(i, nbytes, ec) = fut.result()
+				if ec != const.ENoError:
+					failures.append(ec)
+				else:
+					uploaded[0] += nbytes
+					pprgr(uploaded[0], total, start_time, initial)
+
+		return failures[0] if failures else const.ENoError
+
 	def _update_progress_entry(self, fullpath, uploadid):
 		progress = {}
 
@@ -1773,34 +1847,40 @@ get information of the given path (dir / file) at Baidu Yun.
 		server = self._locate_upload_server(remotepath, uploadid)
 
 		# 3. 逐个分片上传
-		with io.open(localpath, 'rb') as f:
-			start_time = time.time()
-			count = 0
-			for i in to_upload:
-				f.seek(i * slice, os.SEEK_SET)
-				self._current_slice = f.read(slice)
-				self._current_slice_md5 = block_list[i]
-				self.pd("Uploading MD5 slice: {}, #{} / {}".format(
-					self._current_slice_md5,
-					count + 1, len(to_upload)))
-				tries = 0
-				while True:
-					ec = self._upload_slice(remotepath, uploadid, i, server)
-					if ec == const.ENoError:
-						self.pd("Slice MD5 match, continuing next slice")
-						pprgr(f.tell(), self._current_file_size, start_time, to_upload[0] * slice)
-						break
-					elif tries < self._retry:
-						tries += 1
-						# TODO: Improve or make it DRY with the _request retry logic
-						perr("Slice MD5 mismatch, waiting {} seconds before retrying...".format(const.RetryDelayInSec))
-						time.sleep(const.RetryDelayInSec)
-						perr("Retrying #{} / {}".format(tries + 1, self._retry))
-					else:
-						break
-				if ec != const.ENoError:
-					return ec
-				count += 1
+		if ThreadPoolExecutor and self._upload_threads > 1 and len(to_upload) > 1:
+			ec = self._upload_slices_parallel(
+					localpath, slice, to_upload, block_list, remotepath, uploadid, server)
+			if ec != const.ENoError:
+				return ec
+		else:
+			with io.open(localpath, 'rb') as f:
+				start_time = time.time()
+				count = 0
+				for i in to_upload:
+					f.seek(i * slice, os.SEEK_SET)
+					self._current_slice = f.read(slice)
+					self._current_slice_md5 = block_list[i]
+					self.pd("Uploading MD5 slice: {}, #{} / {}".format(
+						self._current_slice_md5,
+						count + 1, len(to_upload)))
+					tries = 0
+					while True:
+						ec = self._upload_slice(remotepath, uploadid, i, server)
+						if ec == const.ENoError:
+							self.pd("Slice MD5 match, continuing next slice")
+							pprgr(f.tell(), self._current_file_size, start_time, to_upload[0] * slice)
+							break
+						elif tries < self._retry:
+							tries += 1
+							# TODO: Improve or make it DRY with the _request retry logic
+							perr("Slice MD5 mismatch, waiting {} seconds before retrying...".format(const.RetryDelayInSec))
+							time.sleep(const.RetryDelayInSec)
+							perr("Retrying #{} / {}".format(tries + 1, self._retry))
+						else:
+							break
+					if ec != const.ENoError:
+						return ec
+					count += 1
 
 		# 4. 创建文件
 		ec = self._create_file(remotepath, self._current_file_size, uploadid, block_list, ondup)
@@ -3784,6 +3864,9 @@ def getparser():
 		parser.add_argument(const.MultiprocessOption,
 			dest="processes", default=const.DefaultProcessCount, type=int,
 			help="Number of parallel processes. (Only applies to dir sync/dl/ul). [default: %(default)s]")
+	parser.add_argument("--upload-threads",
+		dest="upload_threads", default=const.DefaultUploadThreads, type=int,
+		help="Number of threads for parallel slice upload of a single file. 1 means sequential. [default: %(default)s]")
 
 	# support aria2c
 	parser.add_argument("--downloader",
@@ -3965,6 +4048,7 @@ def main(argv=None): # IGNORE:C0111
 			'deletesource': args.deletesource,
 			'downloader': args.downloader,
 			'downloader_args': dl_args,
+			'upload_threads': args.upload_threads,
 			'verbose': args.verbose,
 			'debug': args.debug}
 		if Pool:
