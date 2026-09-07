@@ -1,6 +1,12 @@
-include bypy/*.pem
 include LICENSE
 include README.md
 include HISTORY.md
 include HISTORY.rst
 include CONTRIBUTING.md
+include PUBLISHING.md
+include requirements.txt
+include release.sh
+include bypy/*.pem
+recursive-include tests *.py
+prune bypy/test
+exclude main.py

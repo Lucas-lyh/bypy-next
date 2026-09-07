@@ -320,7 +320,12 @@ class ByPy(object):
 		downloader_args = "",
 		processes = const.DefaultProcessCount,
 		secretkey = const.SecretKey,
-		upload_threads = const.DefaultUploadThreads):
+		upload_threads = const.DefaultUploadThreads,
+		skip_rapid_upload = False):
+		if rapiduploadonly and skip_rapid_upload:
+			raise ValueError("rapiduploadonly and skip_rapid_upload are mutually exclusive")
+		if not apikey or not secretkey:
+			raise ValueError("Direct Baidu authorization requires a nonempty API key and secret")
 		super(ByPy, self).__init__()
 		self.jsonq = deque(maxlen = 64)
 
@@ -328,8 +333,6 @@ class ByPy(object):
 		# so if any code using this class can check the current verbose / debug level
 		cached.verbose = self.verbose = verbose
 		cached.debug = self.debug = debug
-
-		self._load_auth_server_list()
 
 		if not cached.usecache:
 			pinfo("Forced hash recalculation, hash cache won't be used")
@@ -370,7 +373,6 @@ class ByPy(object):
 		self._requester = requester
 		self._apikey = apikey
 		self._secretkey = secretkey
-		self._use_server_auth = not secretkey
 
 		self._slice_size = slice_size
 		self._dl_chunk_size = dl_chunk_size
@@ -388,6 +390,7 @@ class ByPy(object):
 			self._ondup = 'O' # O - Overwrite* S - Skip P - Prompt
 		self._followlink = followlink
 		self._rapiduploadonly = rapiduploadonly
+		self._skip_rapid_upload = skip_rapid_upload
 		self._resumedl_revertcount = resumedl_revertcount
 		self._deletesource = deletesource
 		if deletesource:
@@ -1022,38 +1025,11 @@ Possible fixes:
 			return const.EInvalidJson
 		return self._store_json_only(j)
 
-	def _server_auth_act(self, r, args):
-		return self._store_json(r)
-
-	def _local_auth_act(self, r, args):
+	def _auth_act(self, r, args):
 		return self._store_json(r)
 
 	def _repr_timeout(self):
 		return self._timeout if self._timeout else 'infinite'
-
-	def _load_auth_server_list(self):
-		# https://stackoverflow.com/a/58941536/404271
-		import pkgutil
-		j = json.loads(pkgutil.get_data(__name__, 'res/auth.json'))
-		self.pd('Auth servers loaded: {}'.format(j))
-		self.AuthServerList = j['AuthServerList']
-		self.RefreshServerList = j['RefreshServerList']
-
-	def _update_auth_server_list(self):
-		try:
-			r = requests.get('https://raw.githubusercontent.com/houtianze/bypy/master/bypy/res/auth.json')
-			if r.status_code == 200:
-				try:
-					j = r.json()
-					self.pd('Auth servers updated: {}'.format(j))
-					self.AuthServerList = j['AuthServerList']
-					self.RefreshServerList = j['RefreshServerList']
-				except ValueError:
-					self.pd("Invalid response for auth servers update, skipping.")
-			else:
-				self.pd("HTTP Status {} while updating auth servers, skipping.".format(r.status_code))
-		except:
-			self.pd("Error occurred while updating auth servers, skipping.")
 
 	def _auth(self):
 		params = {
@@ -1062,7 +1038,7 @@ Possible fixes:
 			'redirect_uri' : 'oob',
 			'scope' : 'basic netdisk' }
 		pars = ulp.urlencode(params)
-		msg = 'Please visit:\n{}\nAnd authorize this app'.format(const.ServerAuthUrl + '?' + pars) + \
+		msg = 'Please visit:\n{}\nAnd authorize this app'.format(const.AuthorizationUrl + '?' + pars) + \
 			'\nPaste the Authorization Code here within 10 minutes.'
 		auth_code = ''
 		while True:
@@ -1072,125 +1048,25 @@ Possible fixes:
 		self.pd("auth_code: {}".format(auth_code))
 		pr('Authorizing, please be patient, it may take upto {} seconds...'.format(self._repr_timeout()))
 
-		if self._use_server_auth:
-			pars = {
-				'code' : auth_code,
-				'bypy_version' : const.__version__,
-				'redirect_uri' : 'oob' }
-
-			result = None
-			# TODO: hacky
-			global perr
-			savedperr = perr
-			if not self.debug:
-				perr = nop
-
-			self._update_auth_server_list()
-			for auth in self.AuthServerList:
-				(url, retry, msg) = auth
-				pr(msg)
-				result = self._get(url, pars, self._server_auth_act, retry = retry, addtoken = False)
-				if result == const.ENoError:
-					break
-			if not self.debug:
-				perr = savedperr
-
-			if result == const.ENoError:
-				pr("Successfully authorized")
-			else:
-				perr("Fatal: All server authorizations failed.")
-				self._prompt_clean()
-				sys.exit(result)
-		else:
-			pars = {
-				'grant_type' : 'authorization_code',
-				'code' : auth_code,
-				'client_id' : self._apikey,
-				'client_secret' : self._secretkey,
-				'redirect_uri' : 'oob'
-			}
-			result = self._post(const.TokenUrl, pars, self._local_auth_act, addtoken = False)
-
-		return result
-
-	def _device_auth_act(self, r, args):
-		dj = r.json()
-		self.pd('device response: {}'.format(dj))
-		return self._get_token(dj)
-
-	def _device_auth(self):
 		pars = {
+			'grant_type' : 'authorization_code',
+			'code' : auth_code,
 			'client_id' : self._apikey,
-			'response_type' : 'device_code',
-			'scope' : 'basic netdisk'}
-		return self._get(const.DeviceAuthUrl, pars, self._device_auth_act, addtoken = False)
-
-	def _get_token_act(self, r, args):
-		return self._store_json(r)
-
-	def _get_token(self, deviceJson):
-		# msg = "Please visit:{}\n" + deviceJson['verification_url'] + \
-		# 	  "\nwithin " + str(deviceJson['expires_in']) + " seconds\n"
-		# "Input the CODE: {}\n".format(deviceJson['user_code'])" + \
-		# 	"and Authorize this little app.\n"
-		msg = "Please visit:\n{}\nwithin {} seconds\n" \
-			"Input the CODE: {}\n" \
-			"and Authorize this little app.\n".format(
-				deviceJson['verification_url'],
-				str(deviceJson['expires_in']),
-				deviceJson['user_code'])
-		ask(msg)
-
-		pars = {
-			'grant_type' : 'device_token',
-			'code' :  deviceJson['device_code'],
-			'client_id' : self._apikey,
-			'client_secret' : self._secretkey}
-
-		return self._get(const.TokenUrl, pars, self._get_token_act, addtoken = False)
+			'client_secret' : self._secretkey,
+			'redirect_uri' : 'oob'
+		}
+		return self._post(const.TokenUrl, pars, self._auth_act, addtoken = False)
 
 	def _refresh_token_act(self, r, args):
 		return self._store_json(r)
 
 	def _refresh_token(self):
-		if self._use_server_auth:
-			pr('Refreshing, please be patient, it may take upto {} seconds...'.format(self._repr_timeout()))
-
-			pars = {
-				'bypy_version' : const.__version__,
-				'refresh_token' : self._json['refresh_token'] }
-
-			result = None
-			# TODO: hacky
-			global perr
-			savedperr = perr
-			if not self.debug:
-				perr = nop
-			self._update_auth_server_list()
-			for refresh in self.RefreshServerList:
-				(url, retry, msg) = refresh
-				pr(msg)
-				result = self._get(url, pars, self._refresh_token_act, retry = retry, addtoken = False)
-				if result == const.ENoError:
-					break
-			if not self.debug:
-				perr = savedperr
-
-			if result == const.ENoError:
-				pr("Token successfully refreshed")
-			else:
-				perr("Token-refreshing on all the servers failed")
-				self._prompt_clean()
-				sys.exit(result)
-
-			return result
-		else:
-			pars = {
-				'grant_type' : 'refresh_token',
-				'refresh_token' : self._json['refresh_token'],
-				'client_secret' : self._secretkey,
-				'client_id' : self._apikey}
-			return self._post(const.TokenUrl, pars, self._refresh_token_act)
+		pars = {
+			'grant_type' : 'refresh_token',
+			'refresh_token' : self._json['refresh_token'],
+			'client_secret' : self._secretkey,
+			'client_id' : self._apikey}
+		return self._post(const.TokenUrl, pars, self._refresh_token_act, addtoken = False)
 
 	def _walk_normal_file(self, dir):
 		#dirb = dir.encode(FileSystemEncoding)
@@ -2043,15 +1919,19 @@ get information of the given path (dir / file) at Baidu Yun.
 
 		result = const.ENoError
 		if self._current_file_size > const.MinRapidUploadFileSize:
-			self.pd("'{}' is being RapidUploaded.".format(self._current_file))
-			result = self._rapidupload_file(localpath, remotepath, ondup)
+			if self._skip_rapid_upload:
+				self.pd("Skipping RapidUpload for '{}', using normal upload.".format(localpath))
+				result = const.IEMD5NotFound
+			else:
+				self.pd("'{}' is being RapidUploaded.".format(self._current_file))
+				result = self._rapidupload_file(localpath, remotepath, ondup)
 			if result == const.ENoError:
 				self.pv("RapidUpload: '{}' =R=> '{}' OK.".format(localpath, remotepath))
 				self._rapiduploaded = True
 			else:
 				self._rapiduploaded = False
 				if not self._rapiduploadonly:
-					self.pd("'{}' can't be RapidUploaded, now trying normal uploading.".format(
+					self.pd("'{}' is using normal uploading.".format(
 						self._current_file))
 					# rapid upload failed, we have to upload manually
 					if self._current_file_size <= self._slice_size:
@@ -3850,9 +3730,13 @@ def getparser():
 	parser.add_argument("--select-fastest-mirror",
 		dest="selectmirror", action="store_true",
 		help="Let the program run some tests and select the fastest PCS mirror it detectes. [default: %(default)s]")
-	parser.add_argument("--rapid-upload-only",
+	rapid_upload_options = parser.add_mutually_exclusive_group()
+	rapid_upload_options.add_argument("--rapid-upload-only",
 		dest="rapiduploadonly", action="store_true",
 		help="only upload large files that can be rapidly uploaded")
+	rapid_upload_options.add_argument("--skip-rapid-upload",
+		dest="skip_rapid_upload", action="store_true",
+		help="skip the initial rapid-upload attempt and use normal upload (slice precreate may still deduplicate on the server)")
 	parser.add_argument("--resume-download-revert-back",
 		dest="resumedl_revertcount", default=const.DefaultResumeDlRevertCount,
 		type=int, metavar='RCOUNT',
@@ -4041,6 +3925,7 @@ def main(argv=None): # IGNORE:C0111
 			'checkssl': args.checkssl,
 			'cacerts': args.cacerts,
 			'rapiduploadonly': args.rapiduploadonly,
+			'skip_rapid_upload': args.skip_rapid_upload,
 			'mirror': args.mirror,
 			'selectmirror': args.selectmirror,
 			'configdir': args.configdir,

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bypy-next"
+dynamic = ["version", "dependencies"]
+description = "Baidu Netdisk client with xpan uploads, parallel slices, and optional rapid upload"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {file = "LICENSE"}
+authors = [{name = "Hou Tianze"}]
+keywords = ["bypy", "baidu", "netdisk", "upload", "sync"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+[project.scripts]
+bypy = "bypy.bypy:main"
+
+[project.gui-scripts]
+bypygui = "bypy.gui:main"
+
+[tool.setuptools]
+packages = ["bypy"]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "bypy.const.__version__"}
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.package-data]
+bypy = ["*.pem"]

@@ -136,13 +136,9 @@ TenYearInSeconds = 60 * 60 * 24 * 366 * 10
 FortyNineDaysInSeconds = 60 * 60 * 24 * 49
 
 #### Baidu PCS constants
-# ==== NOTE ====
-# I use server auth, because it's the only method I know that can conceal the SecretKey.
-# If you want to perform local authorization using 'Device' method instead, you just need:
-# - Paste your own ApiKey and SecretKey. (A non-empty SecretKey will change auth mode to device)
-# - Change the AppPcsPath to your own App's directory at Baidu PCS
-# Then you are good to go
-# replace with your own API key and secret if you are using your own appid, or set env vars
+# Direct Baidu OAuth uses the app credentials inherited from upstream bypy.
+# Override them with BAIDU_API_KEY / BAIDU_API_SECRET for your own application,
+# and update AppPcsPath to match that application's directory.
 ApiKey = os.environ['BAIDU_API_KEY'] if 'BAIDU_API_KEY' in os.environ else 'q8WE4EpCsau1oS0MplgMKNBn'
 SecretKey = os.environ['BAIDU_API_SECRET'] if 'BAIDU_API_SECRET' in os.environ else 'PA4MhwB5RE7DacKtoP2i8ikCnNzAqYTD'
 # NOTE: no trailing '/'
@@ -153,8 +149,7 @@ AppPcsPathLen = len(AppPcsPath)
 OpenApiUrl = "https://openapi.baidu.com"
 OpenApiVersion = "2.0"
 OAuthUrl = OpenApiUrl + "/oauth/" + OpenApiVersion
-ServerAuthUrl = OAuthUrl + "/authorize"
-DeviceAuthUrl = OAuthUrl + "/device/code"
+AuthorizationUrl = OAuthUrl + "/authorize"
 TokenUrl = OAuthUrl + "/token"
 PcsDomain = 'pcs.baidu.com'
 RestApiPath = '/rest/2.0/pcs/'

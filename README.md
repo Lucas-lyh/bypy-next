@@ -1,30 +1,21 @@
-bypy - Python client for Baidu Yun (Personal Cloud Storage) 百度云/百度网盘Python客户端
+bypy-next - Python client for Baidu Yun (Personal Cloud Storage) 百度云/百度网盘Python客户端
 ====================================================================================
-
-[![alt text](https://img.shields.io/pypi/v/bypy.svg "PyPi Version")](https://pypi.python.org/pypi/bypy)
-[![alt text](https://img.shields.io/pypi/dm/bypy.svg "PyPi Downloads")](https://pypi.python.org/pypi/bypy)
-[![alt text](https://travis-ci.org/houtianze/bypy.svg "Build status")](https://travis-ci.org/houtianze/bypy)
-[![Coverage Status](https://coveralls.io/repos/houtianze/bypy/badge.svg?branch=master&service=github)](https://coveralls.io/github/houtianze/bypy?branch=master)
-[![Code Climate](https://codeclimate.com/github/houtianze/bypy/badges/gpa.svg)](https://codeclimate.com/github/houtianze/bypy)
-[![Join the chat at https://gitter.im/houtianze/bypy](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/houtianze/bypy?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-
-[![Stand With Ukraine](https://raw.githubusercontent.com/vshymanskyy/StandWithUkraine/main/banner2-direct.svg)](https://stand-with-ukraine.pp.ua)
 
 极简说明
 -------
 
-- 安装: `pip install bypy`
+- 安装: `pip install bypy-next`
 - 运行: `bypy`
 
 TL;DR
 -----
 
-- To install: `pip install bypy`
+- To install: `pip install bypy-next`
 - To use: `bypy`
 
-**此项目已经进入维护状态：不会再有新的功能加入，只有在发现重大bug情况下才会有 _可能_ 更新。**
+本项目是 [houtianze/bypy](https://github.com/houtianze/bypy) 的分叉，发布名为 `bypy-next`，命令仍为 `bypy` / `bypygui`，Python 导入仍为 `from bypy import ByPy`。保留原项目的 MIT 许可证和版权声明。请使用独立虚拟环境，不要与原版 `bypy` 同时安装。
 
-**This is project is now in "maintenance" mode: NO new features will be added, and _may_ be updated only if critical bugs are found.**
+This fork is distributed as `bypy-next`, retaining the `bypy` module and command names. Install it in a separate environment from the original `bypy`. See [PUBLISHING.md](PUBLISHING.md) for build and release instructions.
 
 ---
 
@@ -41,16 +32,28 @@ This fork contains two changes on top of the original bypy:
 1. **Fix broken slice upload / rapidupload** by migrating to the current xpan API (`precreate` → `locateupload` → `superfile2` with `uploadid`/`partseq` → `create`). Rapid-upload now goes through `precreate`, the default slice size is 4MB (required for normal users), and resumable upload is handled server-side via `uploadid`.
 2. **Parallel slice upload**: new `--upload-threads N` option (default: 4) uploads the slices of a single file concurrently (~3.7x faster in a 100MB test). Use `--upload-threads 1` for the old sequential behavior.
 
+跳过秒传尝试 / Skip the initial rapid-upload attempt:
+
+```bash
+python -m bypy --skip-rapid-upload upload ./example.zip /example.zip
+```
+
+`--skip-rapid-upload` 跳过客户端额外的秒传尝试，直接走普通上传，适用于文件上传、目录上传和 `syncup`。默认仍先尝试秒传，不能与 `--rapid-upload-only` 同时使用。大文件分片上传必需的 `precreate` 仍可能由服务端命中秒传，因此此选项不保证传输全部字节。Python 调用可使用 `ByPy(skip_rapid_upload=True)`。
+
+This option skips the client's initial rapid-upload attempt for file/directory uploads and `syncup`. It is mutually exclusive with `--rapid-upload-only`. Required slice precreation can still deduplicate on the server; this does not force every byte to be transferred. Python callers can use `ByPy(skip_rapid_upload=True)`.
+
 ---
 
-**如果有人想帮助搭国内建授权服务器的话，请按以下步骤进行:**
+授权与应用凭据 / Authorization and application credentials
+----------------------------------------------------------
 
-1. Clone <https://github.com/houtianze/bypyoauth> 并用任意值配置好环境变量后成功运行服务
-2. Fork 此repo，并把你的新服务器地址加到这里 <https://github.com/houtianze/bypy/blob/master/bypy/res/auth.json>
-3. 创建拉取请求，然后通过 [![Join the chat at https://gitter.im/houtianze/bypy](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/houtianze/bypy?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge) 或者在拉取请求里留下你的联系方式
-4. 我测试新服务器可以使用后，通过Gitter/邮件把Secret Key发给你，你用正确的配置启动授权服务器
-5. 新的授权服务器配置好后我合并拉取请求
-6. 谢谢。
+客户端直接调用百度 OAuth 接口完成授权码兑换和 token 刷新，用户 token 默认保存在本机 `~/.bypy/bypy.json`。
+
+**`bypy-next` 暂时沿用原仓库 `houtianze/bypy` 内置的 API Key 和 SecretKey，并非本分叉独立申请的百度应用。** 这些默认凭据来自上游 2022 年 9 月 1 日的提交 `108e289`（`No more server auth`）。本分叉的默认授权能力仍依赖该上游应用及其凭据保持可用。
+
+如使用自己的百度应用，可在启动前通过 `BAIDU_API_KEY` 和 `BAIDU_API_SECRET` 环境变量覆盖凭据，并将 `bypy/const.py` 中的 `AppPcsPath` 改成该应用对应的目录。两项凭据均须非空。应用 SecretKey 与用户授权后生成的 access token / refresh token 是不同的凭据。
+
+The client exchanges authorization codes and refreshes tokens directly with Baidu OAuth. User tokens are stored locally in `~/.bypy/bypy.json` by default. **For now, `bypy-next` reuses the API Key and SecretKey bundled in upstream `houtianze/bypy`; this fork does not have its own Baidu application.** The defaults come from upstream commit `108e289` dated September 1, 2022, and depend on that application's continued availability. To use your own app, set nonempty `BAIDU_API_KEY` and `BAIDU_API_SECRET` environment variables before startup and adjust `AppPcsPath` in `bypy/const.py` to your app's directory.
 
 ---
 
@@ -78,7 +81,7 @@ This fork contains two changes on top of the original bypy:
 安装
 ---
 
-- 通过`pip`来安装：`pip install bypy` （支持Python 2.7+, 3.3+)
+- 通过`pip`来安装：`pip install bypy-next` （本分叉当前声明 Python 3.8+）
 
 运行
 ---
@@ -205,7 +208,7 @@ Prerequisite
 Installation
 ------------
 
-- `pip install bypy` (Supports Python 2.7+, 3.3+)
+- `pip install bypy-next` (This fork currently requires Python 3.8+)
 
 Usage
 -----
